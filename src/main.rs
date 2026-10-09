@@ -5,7 +5,6 @@ mod osd;
 use cosmic::{
     app::Task,
     iced::{
-        futures::{SinkExt, StreamExt},
         stream, Alignment, Length, Subscription,
     },
     iced_widget::row,
@@ -13,12 +12,11 @@ use cosmic::{
 };
 use inotify::{EventMask, WatchMask};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::{sync::watch, task::JoinSet};
 
 const CAPS_LOCK_ICON: &[u8] =
     include_bytes!("../resources/icons/hicolor/scalable/status/caps-lock-symbolic.svg");
@@ -132,47 +130,47 @@ impl cosmic::Application for CapsLockIndicator {
 }
 
 pub(crate) async fn poll_method(mut output: cosmic::iced::futures::channel::mpsc::Sender<Message>) {
-    let (folders_tx, folders) = watch::channel(HashSet::<PathBuf>::default());
-
-    let folders_watch_loop = tokio::task::spawn(async move {
+    // Poll on a plain thread with blocking reads: sysfs reads are tiny, and this
+    // keeps the UI thread asleep until the state actually changes.
+    std::thread::spawn(move || {
+        let mut leds = Vec::new();
+        let mut last_scan = None::<Instant>;
+        let mut last_sent = None;
         loop {
-            let Ok(mut read_dir) = tokio::fs::read_dir("/sys/class/leds").await else {
-                continue;
-            };
-
-            let mut folders = HashSet::<PathBuf>::default();
-            while let Ok(Some(dir)) = read_dir.next_entry().await {
-                if dir.file_name().to_str().unwrap().ends_with("::capslock") {
-                    folders.insert(dir.path().join("brightness"));
-                }
+            // Keyboards can be plugged in or out, so rescan the LEDs every second.
+            if last_scan.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                last_scan = Some(Instant::now());
+                leds = capslock_leds();
             }
 
-            let _ = folders_tx.send(folders);
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            let caps_active = leds.iter().any(|led| {
+                std::fs::read_to_string(led).is_ok_and(|brightness| brightness.starts_with('1'))
+            });
+
+            if last_sent != Some(caps_active) {
+                last_sent = Some(caps_active);
+                if output.try_send(Message::Update(Ok(caps_active))).is_err() {
+                    // The subscription is gone, so nobody is listening anymore.
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     });
 
-    loop {
-        let mut join_set = JoinSet::new();
+    std::future::pending::<()>().await;
+}
 
-        for folder in folders.borrow().iter().cloned() {
-            join_set.spawn(tokio::fs::read_to_string(folder));
-        }
-
-        let mut caps_brightness = 0_usize;
-        while let Some(folder_read) = join_set.join_next().await {
-            let Ok(Ok(brightness)) = folder_read else {
-                continue;
-            };
-            if brightness.starts_with('1') {
-                caps_brightness += 1;
-                break;
-            }
-        }
-
-        let _ = output.send(Message::Update(Ok(caps_brightness > 0))).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+/// Brightness files of every Caps Lock LED, one per keyboard.
+fn capslock_leds() -> Vec<PathBuf> {
+    let Ok(read_dir) = std::fs::read_dir("/sys/class/leds") else {
+        return Vec::new();
+    };
+    read_dir
+        .flatten()
+        .filter(|dir| dir.file_name().to_string_lossy().ends_with("::capslock"))
+        .map(|dir| dir.path().join("brightness"))
+        .collect()
 }
 // async fn inotify_method(mut output: cosmic::iced::futures::channel::mpsc::Sender<Message>) {
 //     let inotify_getter = async || {
